@@ -1,0 +1,13 @@
+
+name: MOJ Promotion Check
+
+on:
+  pull_request:
+    branches:
+      - main
+      - moj-uat
+      - moj
+
+jobs:
+  promotion-check:
+    uses: Waleed-DTS-Abacus/lab-ccoe-workflows/.github/workflows/reusable-promotion.yaml@main
