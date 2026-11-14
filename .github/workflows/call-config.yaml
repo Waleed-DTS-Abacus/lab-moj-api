@@ -1,0 +1,13 @@
+
+name: MOJ Config Pipeline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  call-config:
+    uses: Waleed-DTS-Abacus/lab-ccoe-workflows/.github/workflows/reusable-config.yaml@main
+    with:
+      app_id: ${{ vars.CONFIG_APP_ID }}
+    secrets:
+      CONFIG_APP_PRIVATE_KEY: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}
