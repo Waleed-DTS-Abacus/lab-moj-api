@@ -228,31 +228,7 @@ fi
 
 # Validate Installation Token Permissions
 # Fail if Contents is not read-only or any other write permission is granted.
-if ! printf '%s' "$TOKEN_RESPONSE" | python3 -c '
-import json
-import sys
-
-try:
-    response = json.load(sys.stdin)
-    permissions = response.get("permissions", {})
-
-    if permissions.get("contents") != "read":
-        raise ValueError("Contents permission must be read-only")
-
-    excessive = [
-        name for name, level in permissions.items()
-        if level in ("write", "admin")
-    ]
-
-    if excessive:
-        raise ValueError("Excessive permissions: " + ", ".join(excessive))
-
-    print("PASS: Installation token permissions are read-only")
-
-except (ValueError, TypeError, KeyError) as exc:
-    print("FAIL: " + str(exc), file=sys.stderr)
-    sys.exit(1)
-'; then
+if ! printf '%s' "$TOKEN_RESPONSE" | python3 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/validate-token-permissions.py"; then
     echo "Error: Installation token permissions validation failed." >&2
     exit 1
 fi
