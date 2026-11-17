@@ -1,0 +1,49 @@
+name: GitHub App Reuse E2E Test
+
+on:
+  push:
+    branches:
+      - feat/github-app-migration
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify scripts syntax
+        run: |
+          bash -n scripts/test-personal-apps.sh
+          bash -n scripts/verify-app-token.sh
+
+      - name: Verify existing GitHub App
+        shell: bash
+        env:
+          APP_ID: ${{ vars.CONFIG_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}
+          CONFIG_REPO: ${{ vars.CONFIG_REPO }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+
+          printf '%s\n' "$APP_PRIVATE_KEY" > "$KEY_FILE"
+
+          OWNER="${CONFIG_REPO%%/*}"
+
+          bash scripts/test-personal-apps.sh \
+            --mode reuse \
+            --owner "$OWNER" \
+            --config-repo "$CONFIG_REPO" \
+            --repo "${GITHUB_REPOSITORY#*/}" \
+            --app-name "lab-moj-config-app" \
+            --existing-app-id "$APP_ID" \
+            --existing-app-key "$KEY_FILE" \
+            --config-file-path "moj/config.json"
