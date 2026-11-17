@@ -121,3 +121,47 @@ jobs:
           else
             echo "PASS: Invalid Private Key was rejected."
           fi
+
+  test-unauthorized-repository:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Generate installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CONFIG_APP_ID }}
+          private-key: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}
+          owner: Waleed-DTS-Abacus
+
+      - name: Verify unauthorized repository is blocked
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          ALLOWED_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $APP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Waleed-DTS-Abacus/lab-ccoe-configs/contents/moj/config.json")
+
+          if [ "$ALLOWED_STATUS" != "200" ]; then
+            echo "FAIL: Authorized repository was not accessible (HTTP $ALLOWED_STATUS)."
+            exit 1
+          fi
+
+          echo "PASS: Authorized repository access confirmed."
+
+          HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $APP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Waleed-DTS-Abacus/lab-ccoe-workflows/contents/README.md")
+
+          if [ "$HTTP_STATUS" = "404" ] || [ "$HTTP_STATUS" = "403" ]; then
+            echo "PASS: Unauthorized repository access denied (HTTP $HTTP_STATUS)."
+          else
+            echo "FAIL: Unexpected HTTP status: $HTTP_STATUS"
+            exit 1
+          fi
