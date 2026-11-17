@@ -243,7 +243,7 @@ fi
 
 # Validate Installation Token Permissions
 # Fail if Contents is not read-only or any other write permission is granted.
-if ! printf '%s' "$TOKEN_RESPONSE" | python3 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/validate-token-permissions.py"; then
+if ! printf '%s' "$TOKEN_RESPONSE" | python3 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/validate-token-permissions.py" "$ORG_NAME/$CONFIG_REPO"; then
     echo "Error: Installation token permissions validation failed." >&2
     exit 1
 fi

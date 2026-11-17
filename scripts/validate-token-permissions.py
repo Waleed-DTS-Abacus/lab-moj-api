@@ -21,6 +21,27 @@ try:
 
     print("PASS: Installation token permissions are read-only")
 
+    if len(sys.argv) > 1:
+        expected_repo = sys.argv[1]
+
+        repositories = response.get("repositories")
+
+        if not isinstance(repositories, list):
+            raise ValueError("Repository scope missing from token response")
+
+        actual_repos = [
+            repo.get("full_name")
+            for repo in repositories
+            if isinstance(repo, dict)
+        ]
+
+        if actual_repos != [expected_repo]:
+            raise ValueError(
+                "Repository scope does not match the expected repository"
+            )
+
+        print("PASS: Installation token restricted to expected repository")
+
 except (ValueError, TypeError, KeyError) as exc:
     print("FAIL: " + str(exc), file=sys.stderr)
     sys.exit(1)
