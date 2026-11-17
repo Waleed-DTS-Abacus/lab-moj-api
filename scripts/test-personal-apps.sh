@@ -368,6 +368,7 @@ set_personal_variable() {
         -d "$body" \
         "$var_url" >/dev/null 2>&1; then
         echo -e "    ${COLOR_GREEN}[OK] Variable '$var_name' updated in $repo_name${COLOR_RESET}"
+        return 0
     else
         local create_url="https://api.github.com/repos/$OWNER/$repo_name/actions/variables"
         if curl -fsSL -X POST \
@@ -378,8 +379,10 @@ set_personal_variable() {
             -d "$body" \
             "$create_url" >/dev/null 2>&1; then
             echo -e "    ${COLOR_GREEN}[OK] Variable '$var_name' created in $repo_name${COLOR_RESET}"
+            return 0
         else
             echo -e "    ${COLOR_YELLOW}[WARN] Could not set variable '$var_name' in $repo_name${COLOR_RESET}" >&2
+            return 1
         fi
     fi
 }
@@ -611,13 +614,23 @@ for i in "${!APP_NAMES[@]}"; do
     if set_personal_secret "$REPO" "CONFIG_APP_PRIVATE_KEY" "$REG_PEM_STRING"; then
         SECRET_SET_2=true
     fi
-    set_personal_variable "$REPO" "CONFIG_REPO" "$CONFIG_REPO"
-    set_personal_variable "$REPO" "CONFIG_APP_ID" "$REG_APP_ID"
+    VARIABLE_SET_1=false
+    VARIABLE_SET_2=false
 
-    if [[ "$SECRET_SET_1" == "true" && "$SECRET_SET_2" == "true" ]]; then
+    if set_personal_variable "$REPO" "CONFIG_REPO" "$CONFIG_REPO"; then
+        VARIABLE_SET_1=true
+    fi
+
+    if set_personal_variable "$REPO" "CONFIG_APP_ID" "$REG_APP_ID"; then
+        VARIABLE_SET_2=true
+    fi
+
+    if [[ "$SECRET_SET_1" == "true" && "$SECRET_SET_2" == "true" && "$VARIABLE_SET_1" == "true" && "$VARIABLE_SET_2" == "true" ]]; then
         SECRET_STATUS_TEXT="Provisioned"
     else
         SECRET_STATUS_TEXT="Check Manual Setup"
+        echo "ERROR: Required GitHub Secrets or Variables provisioning failed." >&2
+        exit 1
     fi
 
     SUMMARY_ROWS+=("${OWNER}/${REPO}|${APP_NAME}|${REG_APP_ID}|${REG_CLIENT_ID}|${APP_NAME}-private-key.pem|Installed|${SECRET_STATUS_TEXT}")
@@ -638,6 +651,6 @@ for row in "${SUMMARY_ROWS[@]}"; do
         "$r_repo" "$r_app" "$r_id" "$r_client" "$r_pem" "$r_inst" "$r_sec"
 done
 
-echo -e "\n${COLOR_GREEN}Both test applications have been created and keys are saved in: $KEY_DIRECTORY${COLOR_RESET}"
+echo -e "\n${COLOR_GREEN}${#SUMMARY_ROWS[@]} GitHub App(s) processed successfully. Keys directory: $KEY_DIRECTORY${COLOR_RESET}"
 
 

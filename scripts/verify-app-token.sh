@@ -209,7 +209,22 @@ echo -e "${COLOR_GREEN}      [OK] Found Installation ID: $INSTALLATION_ID (Targe
 # 5. Mint Short-Lived Installation Token
 echo -e "${COLOR_CYAN}[4/4] Minting ephemeral installation access token...${COLOR_RESET}"
 TOKEN_URL="https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens"
+
+TOKEN_REQUEST_BODY="$(python3 - "$CONFIG_REPO" <<'PYEOF'
+import json
+import sys
+
+repo = sys.argv[1].split("/")[-1]
+print(json.dumps({
+    "repositories": [repo],
+    "permissions": {"contents": "read"}
+}))
+PYEOF
+)"
+
 if ! TOKEN_RESPONSE="$(curl -fsSL -X POST \
+    -H "Content-Type: application/json" \
+    -d "$TOKEN_REQUEST_BODY" \
     -H "Authorization: Bearer $JWT" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
