@@ -165,3 +165,36 @@ jobs:
             echo "FAIL: Unexpected HTTP status: $HTTP_STATUS"
             exit 1
           fi
+
+  test-token-permissions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate token permission policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VALIDATOR="scripts/validate-token-permissions.py"
+
+          echo "Testing contents: read"
+          printf '%s\n' '{"permissions":{"contents":"read"}}' | python3 "$VALIDATOR"
+          echo "PASS: Read-only permissions accepted."
+
+          echo "Testing contents: write"
+          if printf '%s\n' '{"permissions":{"contents":"write"}}' | python3 "$VALIDATOR"; then
+            echo "FAIL: Write permission was accepted."
+            exit 1
+          else
+            echo "PASS: Write permission rejected."
+          fi
+
+          echo "Testing additional issues: write"
+          if printf '%s\n' '{"permissions":{"contents":"read","issues":"write"}}' | python3 "$VALIDATOR"; then
+            echo "FAIL: Additional write permission was accepted."
+            exit 1
+          else
+            echo "PASS: Additional write permission rejected."
+          fi
