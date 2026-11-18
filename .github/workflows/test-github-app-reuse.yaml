@@ -20,6 +20,7 @@ jobs:
         run: |
           bash -n scripts/manage-config-github-app.sh
           bash -n scripts/verify-app-token.sh
+          bash -n scripts/validate-token-permissions.sh
 
       - name: Verify existing GitHub App
         shell: bash
@@ -177,24 +178,62 @@ jobs:
         run: |
           set -euo pipefail
 
-          VALIDATOR="scripts/validate-token-permissions.py"
+          VALIDATOR="scripts/validate-token-permissions.sh"
 
-          echo "Testing contents: read"
-          printf '%s\n' '{"permissions":{"contents":"read"}}' | python3 "$VALIDATOR"
-          echo "PASS: Read-only permissions accepted."
+          expect_accept() {
+            local label="$1"
+            local json="$2"
+            shift 2
+            if printf '%s\n' "$json" | bash "$VALIDATOR" "$@"; then
+              echo "PASS: $label"
+            else
+              echo "FAIL: $label should be accepted."
+              exit 1
+            fi
+          }
 
-          echo "Testing contents: write"
-          if printf '%s\n' '{"permissions":{"contents":"write"}}' | python3 "$VALIDATOR"; then
-            echo "FAIL: Write permission was accepted."
-            exit 1
-          else
-            echo "PASS: Write permission rejected."
-          fi
+          expect_reject() {
+            local label="$1"
+            local json="$2"
+            shift 2
+            if printf '%s\n' "$json" | bash "$VALIDATOR" "$@"; then
+              echo "FAIL: $label should be rejected."
+              exit 1
+            else
+              echo "PASS: $label rejected."
+            fi
+          }
 
-          echo "Testing additional issues: write"
-          if printf '%s\n' '{"permissions":{"contents":"read","issues":"write"}}' | python3 "$VALIDATOR"; then
-            echo "FAIL: Additional write permission was accepted."
-            exit 1
-          else
-            echo "PASS: Additional write permission rejected."
-          fi
+          expect_accept "Read-only permissions accepted" \
+            '{"permissions":{"contents":"read"}}'
+          expect_reject "contents: write rejected" \
+            '{"permissions":{"contents":"write"}}'
+          expect_reject "Additional issues: write rejected" \
+            '{"permissions":{"contents":"read","issues":"write"}}'
+          expect_reject "Additional admin permission rejected" \
+            '{"permissions":{"contents":"read","issues":"admin"}}'
+          expect_reject "Missing permissions rejected" \
+            '{}'
+          expect_reject "Missing contents permission rejected" \
+            '{"permissions":{"issues":"read"}}'
+          expect_reject "Malformed permissions rejected" \
+            '{"permissions":[]}'
+          expect_reject "Malformed permission value rejected" \
+            '{"permissions":{"contents":"read","issues":[]}}'
+          expect_accept "Single expected repository accepted" \
+            '{"permissions":{"contents":"read"},"repositories":[{"full_name":"Waleed-DTS-Abacus/lab-ccoe-configs"}]}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Expanded repository scope rejected" \
+            '{"permissions":{"contents":"read"},"repositories":[{"full_name":"Waleed-DTS-Abacus/lab-ccoe-configs"},{"full_name":"Waleed-DTS-Abacus/lab-ccoe-workflows"}]}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Missing repository scope rejected" \
+            '{"permissions":{"contents":"read"}}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Malformed repository scope rejected" \
+            '{"permissions":{"contents":"read"},"repositories":[{"name":"lab-ccoe-configs"}]}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Empty repository name rejected" \
+            '{"permissions":{"contents":"read"},"repositories":[{"full_name":""}]}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Malformed JSON rejected" \
+            '{"permissions":'

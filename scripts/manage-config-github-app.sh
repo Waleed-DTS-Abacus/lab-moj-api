@@ -22,6 +22,7 @@
 # ==============================================================================
 
 set -uo pipefail
+umask 077
 
 # ANSI Color Codes
 COLOR_MAGENTA='\033[0;35m'
@@ -44,6 +45,12 @@ APP_MODE="${APP_MODE:-}"
 EXISTING_APP_ID="${EXISTING_APP_ID:-}"
 EXISTING_APP_KEY="${EXISTING_APP_KEY:-}"
 CONFIG_FILE_PATH="${CONFIG_FILE_PATH:-}"
+
+CALLBACK_LISTENER_PID=""
+CALLBACK_TEMP_DIR=""
+CALLBACK_CODE_FILE=""
+CALLBACK_HANDLER_PATH=""
+CALLBACK_LISTENER_LOG=""
 
 APP_NAMES=()
 REPOS=()
@@ -214,31 +221,18 @@ if [[ "$APP_MODE" == "create" && -z "${GITHUB_TOKEN// /}" ]]; then
     exit 1
 fi
 
-# Helper: Find an unreserved, available local port
-get_available_port() {
-    local preferred="${1:-8181}"
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$preferred" <<'PYEOF'
-import socket, sys
-start = int(sys.argv[1])
-for p in range(start, start + 50):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("127.0.0.1", p))
-            print(p)
-            sys.exit(0)
-        except OSError:
-            continue
-print(start)
-PYEOF
-    else
-        echo "$preferred"
-    fi
-}
+if [[ "$APP_MODE" == "create" ]]; then
+    for dependency in jq socat gh curl openssl mktemp chmod; do
+        if ! command -v "$dependency" >/dev/null 2>&1; then
+            echo -e "${COLOR_RED}Error: '$dependency' is required for GitHub App creation.${COLOR_RESET}" >&2
+            exit 1
+        fi
+    done
 
-# Auto-detect available port if not specified or defaulting to 0 / 8080
-if [[ "$CALLBACK_PORT" -eq 0 || "$CALLBACK_PORT" -eq 8080 ]]; then
-    CALLBACK_PORT="$(get_available_port 8181)"
+    if ! GH_TOKEN="$GITHUB_TOKEN" gh auth status --hostname github.com >/dev/null 2>&1; then
+        echo -e "${COLOR_RED}Error: GitHub CLI is not authenticated. Check GH_TOKEN and GitHub CLI access.${COLOR_RESET}" >&2
+        exit 1
+    fi
 fi
 
 # Resolve Keys Directory
@@ -246,7 +240,232 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -z "${KEY_DIRECTORY// /}" || "$KEY_DIRECTORY" == "/keys" || "$KEY_DIRECTORY" == '\keys' ]]; then
     KEY_DIRECTORY="${SCRIPT_DIR}/keys"
 fi
-mkdir -p "$KEY_DIRECTORY"
+if ! mkdir -p "$KEY_DIRECTORY" || ! chmod 700 "$KEY_DIRECTORY"; then
+    echo -e "${COLOR_RED}Error: Could not create or secure the private-key directory.${COLOR_RESET}" >&2
+    exit 1
+fi
+
+cleanup_callback_resources() {
+    if [[ -n "$CALLBACK_LISTENER_PID" ]]; then
+        kill "$CALLBACK_LISTENER_PID" 2>/dev/null || true
+        wait "$CALLBACK_LISTENER_PID" 2>/dev/null || true
+        CALLBACK_LISTENER_PID=""
+    fi
+
+    [[ -n "$CALLBACK_CODE_FILE" ]] && rm -f -- "$CALLBACK_CODE_FILE"
+    [[ -n "$CALLBACK_HANDLER_PATH" ]] && rm -f -- "$CALLBACK_HANDLER_PATH"
+    [[ -n "$CALLBACK_LISTENER_LOG" ]] && rm -f -- "$CALLBACK_LISTENER_LOG"
+    if [[ -n "$CALLBACK_TEMP_DIR" ]]; then
+        rmdir -- "$CALLBACK_TEMP_DIR" 2>/dev/null || true
+        CALLBACK_TEMP_DIR=""
+    fi
+    CALLBACK_CODE_FILE=""
+    CALLBACK_HANDLER_PATH=""
+    CALLBACK_LISTENER_LOG=""
+}
+
+prepare_callback_handler() {
+    CALLBACK_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/github-app-callback.XXXXXX")" || {
+        echo -e "${COLOR_RED}Error: Could not create a private callback work directory.${COLOR_RESET}" >&2
+        return 1
+    }
+    chmod 700 "$CALLBACK_TEMP_DIR"
+    CALLBACK_CODE_FILE="${CALLBACK_TEMP_DIR}/code"
+    CALLBACK_HANDLER_PATH="${CALLBACK_TEMP_DIR}/callback-handler.sh"
+    CALLBACK_LISTENER_LOG="${CALLBACK_TEMP_DIR}/socat.log"
+
+    if ! chmod 700 "$CALLBACK_TEMP_DIR"; then
+        echo -e "${COLOR_RED}Error: Could not secure the callback work directory.${COLOR_RESET}" >&2
+        cleanup_callback_resources
+        return 1
+    fi
+
+    if ! cat > "$CALLBACK_HANDLER_PATH" <<'CALLBACK_HANDLER'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+local_decode_query_value() {
+    local LC_ALL=C
+    local input="$1"
+    local output=""
+    local character hex index=0
+
+    while (( index < ${#input} )); do
+        character="${input:index:1}"
+        case "$character" in
+            %)
+                hex="${input:$((index + 1)):2}"
+                [[ "$hex" =~ ^[[:xdigit:]]{2}$ && "$hex" != "00" ]] || return 1
+                printf -v character '%b' "\\x${hex}"
+                output+="$character"
+                index=$((index + 3))
+                ;;
+            +)
+                output+=" "
+                index=$((index + 1))
+                ;;
+            *)
+                output+="$character"
+                index=$((index + 1))
+                ;;
+        esac
+    done
+
+    printf '%s' "$output"
+}
+
+send_response() {
+    local status="$1"
+    local body="$2"
+    printf 'HTTP/1.1 %s\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+        "$status" "${#body}" "$body"
+}
+
+IFS= read -r request_line || exit 1
+request_line="${request_line%$'\r'}"
+while IFS= read -r header; do
+    [[ -z "$header" || "$header" == $'\r' ]] && break
+done
+
+if [[ "$request_line" != GET\ *\ HTTP/1.0 && "$request_line" != GET\ *\ HTTP/1.1 ]]; then
+    send_response "400 Bad Request" "<html><body>Invalid callback request.</body></html>"
+    exit 0
+fi
+
+request_target="${request_line#GET }"
+request_target="${request_target%% *}"
+if [[ "$request_target" != /callback\?* ]]; then
+    send_response "404 Not Found" "<html><body>Callback not found.</body></html>"
+    exit 0
+fi
+
+query="${request_target#*\?}"
+callback_code=""
+IFS='&' read -r -a query_fields <<< "$query"
+for field in "${query_fields[@]}"; do
+    if [[ "${field%%=*}" == "code" && "$field" == *=* ]]; then
+        callback_code="$(local_decode_query_value "${field#*=}")" || {
+            send_response "400 Bad Request" "<html><body>Invalid callback code.</body></html>"
+            exit 0
+        }
+        break
+    fi
+done
+
+if [[ -z "$callback_code" || "$callback_code" =~ [[:cntrl:]] ]]; then
+    send_response "400 Bad Request" "<html><body>Invalid callback code.</body></html>"
+    exit 0
+fi
+
+if [[ -e "$CALLBACK_CODE_FILE" ]] || ! (set -o noclobber; printf '%s\n' "$callback_code" > "$CALLBACK_CODE_FILE") 2>/dev/null; then
+    send_response "409 Conflict" "<html><body>Callback already received.</body></html>"
+    exit 0
+fi
+
+send_response "200 OK" "<html><body style='font-family:sans-serif;text-align:center;padding:50px;'><h2>App Created Successfully!</h2><p>You can close this tab and return to your terminal.</p></body></html>"
+CALLBACK_HANDLER
+    then
+        echo -e "${COLOR_RED}Error: Could not create the callback handler.${COLOR_RESET}" >&2
+        cleanup_callback_resources
+        return 1
+    fi
+
+    if ! chmod 700 "$CALLBACK_HANDLER_PATH"; then
+        echo -e "${COLOR_RED}Error: Could not secure the callback handler.${COLOR_RESET}" >&2
+        cleanup_callback_resources
+        return 1
+    fi
+}
+
+start_callback_listener() {
+    local requested_port="$CALLBACK_PORT"
+    local first_port last_port port attempt ready listener_output auto_select=false
+    local port_number
+
+    if [[ ! "$requested_port" =~ ^[0-9]+$ ]]; then
+        echo -e "${COLOR_RED}Error: Callback port must be a number between 0 and 65535.${COLOR_RESET}" >&2
+        return 1
+    fi
+    port_number=$((10#$requested_port))
+    if (( port_number < 0 || port_number > 65535 )); then
+        echo -e "${COLOR_RED}Error: Callback port must be between 0 and 65535.${COLOR_RESET}" >&2
+        return 1
+    fi
+
+    if (( port_number == 0 || port_number == 8080 )); then
+        auto_select=true
+        first_port=8181
+        last_port=$((first_port + 49))
+    else
+        first_port="$port_number"
+        last_port="$port_number"
+    fi
+
+    for ((port = first_port; port <= last_port; port++)); do
+        : > "$CALLBACK_LISTENER_LOG"
+        CALLBACK_CODE_FILE="$CALLBACK_CODE_FILE" socat -d -d \
+            "TCP-LISTEN:${port},bind=127.0.0.1,reuseaddr,fork" \
+            "EXEC:${CALLBACK_HANDLER_PATH}" \
+            >/dev/null 2>"$CALLBACK_LISTENER_LOG" &
+        CALLBACK_LISTENER_PID=$!
+
+        ready=false
+        for ((attempt = 0; attempt < 40; attempt++)); do
+            if ! kill -0 "$CALLBACK_LISTENER_PID" 2>/dev/null; then
+                wait "$CALLBACK_LISTENER_PID" 2>/dev/null || true
+                CALLBACK_LISTENER_PID=""
+                break
+            fi
+            listener_output="$(<"$CALLBACK_LISTENER_LOG")"
+            if [[ "$listener_output" == *"listening on"* ]]; then
+                ready=true
+                break
+            fi
+            sleep 0.05
+        done
+
+        if [[ "$ready" == true ]]; then
+            CALLBACK_PORT="$port"
+            return 0
+        fi
+
+        if [[ -n "$CALLBACK_LISTENER_PID" ]]; then
+            kill "$CALLBACK_LISTENER_PID" 2>/dev/null || true
+            wait "$CALLBACK_LISTENER_PID" 2>/dev/null || true
+            CALLBACK_LISTENER_PID=""
+        fi
+
+        if [[ "$auto_select" != true ]]; then
+            echo -e "${COLOR_RED}Error: Could not bind the callback listener to port $port. Ensure the port is available.${COLOR_RESET}" >&2
+            return 1
+        fi
+    done
+
+    echo -e "${COLOR_RED}Error: Could not bind the callback listener to any port from $first_port through $last_port.${COLOR_RESET}" >&2
+    return 1
+}
+
+decode_url_path_segment() {
+    local LC_ALL=C
+    local input="$1"
+    local output=""
+    local character hex index
+
+    for ((index = 0; index < ${#input}; index++)); do
+        character="${input:index:1}"
+        case "$character" in
+            [a-zA-Z0-9._~-])
+                output+="$character"
+                ;;
+            *)
+                printf -v hex '%02X' "'$character"
+                output+="%${hex}"
+                ;;
+        esac
+    done
+
+    printf '%s' "$output"
+}
 
 # Helper: Open file or URL in browser across Windows / Linux / WSL / macOS
 open_browser() {
@@ -282,72 +501,30 @@ open_browser() {
     fi
 }
 
-# --- Helper: Upload Secret (gh CLI -> Python PyNaCl) ---
+# --- Helper: Upload Secret with GitHub CLI ---
 set_personal_secret() {
     local repo_name="$1"
     local secret_name="$2"
     local secret_value="$3"
+    local gh_path
 
-    # 1. Try GitHub CLI
-    local gh_path=""
-    if command -v gh >/dev/null 2>&1; then
-        gh_path="$(command -v gh)"
-    elif [[ -x "/usr/local/bin/gh" ]]; then
-        gh_path="/usr/local/bin/gh"
+    if ! gh_path="$(command -v gh)"; then
+        echo -e "${COLOR_RED}Error: GitHub CLI (gh) is required to set Actions secrets.${COLOR_RESET}" >&2
+        return 1
     fi
 
-    if [[ -n "$gh_path" ]]; then
-        export GH_TOKEN="$GITHUB_TOKEN"
-        if "$gh_path" secret set "$secret_name" -R "$OWNER/$repo_name" --body "$secret_value"; then
-            echo -e "    ${COLOR_GREEN}[OK] Secret '$secret_name' set via gh CLI in $repo_name${COLOR_RESET}"
-            return 0
-        fi
+    if [[ -z "$GITHUB_TOKEN" ]]; then
+        echo -e "${COLOR_RED}Error: A GitHub CLI token is required to set Actions secrets.${COLOR_RESET}" >&2
+        return 1
     fi
 
-    # 2. Try Python PyNaCl fallback
-    if command -v python3 >/dev/null 2>&1; then
-        local key_url="https://api.github.com/repos/$OWNER/$repo_name/actions/secrets/public-key"
-        local pub_key_json
-        pub_key_json="$(curl -fsSL \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "User-Agent: CAIT-Test-Runner" \
-            "$key_url" 2>/dev/null || true)"
-
-        if [[ -n "$pub_key_json" ]]; then
-            local payload
-            payload="$( SECRET_VALUE="$secret_value" PUB_KEY_JSON="$pub_key_json" python3 - <<'PYEOF' 2>/dev/null || true
-import base64, json, os
-from nacl import encoding, public
-
-pub = json.loads(os.environ["PUB_KEY_JSON"])
-secret = os.environ["SECRET_VALUE"]
-public_key = public.PublicKey(pub["key"].encode("utf-8"), encoding.Base64Encoder())
-sealed_box = public.SealedBox(public_key)
-encrypted = base64.b64encode(sealed_box.encrypt(secret.encode("utf-8"))).decode("utf-8")
-print(json.dumps({"encrypted_value": encrypted, "key_id": pub["key_id"]}))
-PYEOF
-)"
-            if [[ -n "$payload" ]]; then
-                local secret_url="https://api.github.com/repos/$OWNER/$repo_name/actions/secrets/$secret_name"
-                if curl -fsSL -X PUT \
-                    -H "Authorization: Bearer $GITHUB_TOKEN" \
-                    -H "Accept: application/vnd.github+json" \
-                    -H "X-GitHub-Api-Version: 2022-11-28" \
-                    -H "User-Agent: CAIT-Test-Runner" \
-                    -d "$payload" \
-                    "$secret_url" >/dev/null 2>&1; then
-                    echo -e "    ${COLOR_GREEN}[OK] Secret '$secret_name' set via Python PyNaCl in $repo_name${COLOR_RESET}"
-                    return 0
-                fi
-            fi
-        fi
+    if ! printf '%s' "$secret_value" | GH_TOKEN="$GITHUB_TOKEN" "$gh_path" secret set \
+        "$secret_name" --repo "$OWNER/$repo_name"; then
+        echo -e "${COLOR_RED}Error: Could not set '$secret_name' in '$OWNER/$repo_name'. Verify GitHub CLI authentication and Actions secrets write permission.${COLOR_RESET}" >&2
+        return 1
     fi
 
-    echo -e "    ${COLOR_YELLOW}[WARN] Could not encrypt secret automatically because neither 'gh' CLI nor 'python3 with PyNaCl' was found.${COLOR_RESET}" >&2
-    echo -e "    ${COLOR_YELLOW}[TIP] Install GitHub CLI (gh) and run 'gh auth login' to enable 1-click encryption!${COLOR_RESET}"
-    return 1
+    echo -e "    ${COLOR_GREEN}[OK] Secret '$secret_name' set via gh CLI in $repo_name${COLOR_RESET}"
 }
 
 # --- Helper: Set Repository Variable ---
@@ -391,11 +568,39 @@ set_personal_variable() {
 # Populates global variables: REG_APP_ID, REG_CLIENT_ID, REG_SLUG, REG_PEM_PATH, REG_PEM_STRING
 register_personal_app_manifest() {
     local app_name="$1"
-    local redirect_url="http://localhost:${CALLBACK_PORT}/callback"
-
+    local redirect_url
     local manifest
-    manifest="$(printf '{"name":"%s","url":"https://github.com/%s","hook_attributes":{"url":"https://example.com/webhook","active":false},"redirect_url":"%s","public":false,"default_permissions":{"contents":"read"},"default_events":[]}' \
-        "$app_name" "$OWNER" "$redirect_url")"
+    local code=""
+    local encoded_code
+    local conversion_url
+    local conversion_resp
+    local pem_path
+    local pem_tmp
+
+    if ! prepare_callback_handler; then
+        return 1
+    fi
+    trap cleanup_callback_resources EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if ! start_callback_listener; then
+        cleanup_callback_resources
+        trap - EXIT INT TERM
+        return 1
+    fi
+
+    redirect_url="http://localhost:${CALLBACK_PORT}/callback"
+    if ! manifest="$(jq -cn \
+        --arg name "$app_name" \
+        --arg owner "$OWNER" \
+        --arg redirect_url "$redirect_url" \
+        '{name:$name,url:("https://github.com/"+$owner),hook_attributes:{url:"https://example.com/webhook",active:false},redirect_url:$redirect_url,public:false,default_permissions:{contents:"read"},default_events:[]}')"; then
+        echo -e "${COLOR_RED}Error: Could not create the GitHub App manifest JSON.${COLOR_RESET}" >&2
+        cleanup_callback_resources
+        trap - EXIT INT TERM
+        return 1
+    fi
 
     # HTML-encode the manifest so it survives as an HTML attribute value.
     # Equivalent to [System.Net.WebUtility]::HtmlEncode() in the .ps1.
@@ -443,84 +648,88 @@ register_personal_app_manifest() {
 </html>
 EOF
 
+    echo -e "${COLOR_CYAN}    Listening on port $CALLBACK_PORT for GitHub authorization code...${COLOR_RESET}"
     echo -e "\n${COLOR_CYAN}>>> [APP: $app_name] Opening browser to register GitHub App on personal account...${COLOR_RESET}"
     echo -e "${COLOR_DARKGRAY}    Form file: $temp_html${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}    ACTION: In your browser, review pre-filled settings and click 'Create GitHub App'.${COLOR_RESET}"
     open_browser "$temp_html"
 
-    echo -e "${COLOR_CYAN}    Listening on port $CALLBACK_PORT for GitHub authorization code...${COLOR_RESET}"
-    local code=""
-    if command -v python3 >/dev/null 2>&1; then
-        code="$(python3 - "$CALLBACK_PORT" <<'PYEOF'
-import http.server, sys, urllib.parse
-
-port = int(sys.argv[1])
-
-class CallbackHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        if "callback" in parsed.path and "code" in params:
-            code = params["code"][0]
-            body = b"<html><body style='font-family:sans-serif;text-align:center;padding:50px;'><h2>App Created Successfully!</h2><p>You can close this tab and return to your terminal.</p></body></html>"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            print(code, flush=True)
-            raise SystemExit(0)
-        else:
-            self.send_response(204)
-            self.end_headers()
-
-server = http.server.HTTPServer(("127.0.0.1", port), CallbackHandler)
-server.serve_forever()
-PYEOF
-)"
-    else
-        echo -e "${COLOR_RED}Error: python3 is required to run the local HTTP callback listener.${COLOR_RESET}" >&2
-        return 1
-    fi
+    while [[ ! -s "$CALLBACK_CODE_FILE" ]]; do
+        if ! kill -0 "$CALLBACK_LISTENER_PID" 2>/dev/null; then
+            echo -e "${COLOR_RED}Error: The GitHub App callback listener stopped unexpectedly.${COLOR_RESET}" >&2
+            cleanup_callback_resources
+            trap - EXIT INT TERM
+            return 1
+        fi
+        sleep 0.2
+    done
+    IFS= read -r code < "$CALLBACK_CODE_FILE" || code=""
 
     if [[ -z "$code" ]]; then
         echo -e "${COLOR_RED}Error: No authorization code returned for $app_name${COLOR_RESET}" >&2
+        cleanup_callback_resources
+        trap - EXIT INT TERM
         return 1
     fi
 
+    cleanup_callback_resources
+    trap - EXIT INT TERM
+
     # 4. Exchange code for App credentials (Code conversion must NOT include Bearer token)
     echo -e "    ${COLOR_GREEN}[OK] Received code! Exchanging for App credentials via REST API...${COLOR_RESET}"
-    local conversion_url="https://api.github.com/app-manifests/${code}/conversions"
-    local conversion_resp
-    conversion_resp="$(curl -fsSL -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        -H "User-Agent: CAIT-Test-Runner" \
-        "$conversion_url")" || {
+    encoded_code="$(decode_url_path_segment "$code")"
+    conversion_url="https://api.github.com/app-manifests/${encoded_code}/conversions"
+    conversion_resp="$(curl -fsSL --config - <<EOF
+url = "$conversion_url"
+request = "POST"
+header = "Accept: application/vnd.github+json"
+header = "X-GitHub-Api-Version: 2022-11-28"
+header = "User-Agent: CAIT-Test-Runner"
+EOF
+    )" || {
         echo -e "${COLOR_RED}Error: Failed to exchange manifest code for $app_name${COLOR_RESET}" >&2
         return 1
     }
 
-    local pem_path="${KEY_DIRECTORY}/${app_name}-private-key.pem"
+    if ! jq -e '
+        type == "object"
+        and (.id | type == "number" or (type == "string" and length > 0))
+        and (.client_id | type == "string" and length > 0)
+        and (.slug | type == "string" and length > 0)
+        and (.pem | type == "string" and length > 0)
+    ' >/dev/null 2>&1 <<< "$conversion_resp"; then
+        echo -e "${COLOR_RED}Error: GitHub returned an invalid App manifest conversion response.${COLOR_RESET}" >&2
+        return 1
+    fi
 
-    # Extract fields and write PEM via python3
-    eval "$(CONVERSION_JSON="$conversion_resp" PEM_OUT="$pem_path" python3 - <<'PYEOF'
-import json, os, shlex
-
-data = json.loads(os.environ["CONVERSION_JSON"])
-pem_path = os.environ["PEM_OUT"]
-with open(pem_path, "w", encoding="utf-8") as f:
-    f.write(data["pem"])
-
-print(f"REG_APP_ID={shlex.quote(str(data['id']))}")
-print(f"REG_CLIENT_ID={shlex.quote(str(data['client_id']))}")
-print(f"REG_SLUG={shlex.quote(str(data['slug']))}")
-PYEOF
-)"
-    chmod 600 "$pem_path"
+    REG_APP_ID="$(jq -r '.id' <<< "$conversion_resp")"
+    REG_CLIENT_ID="$(jq -r '.client_id' <<< "$conversion_resp")"
+    REG_SLUG="$(jq -r '.slug' <<< "$conversion_resp")"
+    pem_path="${KEY_DIRECTORY}/${app_name}-private-key.pem"
+    pem_tmp="$(mktemp "${pem_path}.tmp.XXXXXX")" || {
+        echo -e "${COLOR_RED}Error: Could not create a secure temporary private-key file.${COLOR_RESET}" >&2
+        return 1
+    }
+    if ! jq -jer '.pem | select(type == "string" and length > 0)' <<< "$conversion_resp" > "$pem_tmp"; then
+        rm -f -- "$pem_tmp"
+        echo -e "${COLOR_RED}Error: Could not extract the private key from GitHub's response.${COLOR_RESET}" >&2
+        return 1
+    fi
+    if ! chmod 600 "$pem_tmp"; then
+        rm -f -- "$pem_tmp"
+        echo -e "${COLOR_RED}Error: Could not secure the generated private-key file.${COLOR_RESET}" >&2
+        return 1
+    fi
+    if ! mv -f -- "$pem_tmp" "$pem_path"; then
+        rm -f -- "$pem_tmp"
+        echo -e "${COLOR_RED}Error: Could not save the generated private-key file.${COLOR_RESET}" >&2
+        return 1
+    fi
+    if ! chmod 600 "$pem_path"; then
+        rm -f -- "$pem_path"
+        echo -e "${COLOR_RED}Error: Could not secure the generated private-key file.${COLOR_RESET}" >&2
+        return 1
+    fi
     REG_PEM_PATH="$pem_path"
     REG_PEM_STRING="$(cat "$pem_path")"
     echo -e "    ${COLOR_GREEN}[SAVED] Private key saved to: $pem_path${COLOR_RESET}"
@@ -635,6 +844,10 @@ for i in "${!APP_NAMES[@]}"; do
     fi
 
     echo "SUCCESS: GitHub App installation verified."
+    if ! chmod 600 "$REG_PEM_PATH"; then
+        echo "ERROR: Could not secure the generated private-key file." >&2
+        exit 1
+    fi
 
     echo -e "\n${COLOR_DARKGRAY}---------------------------------------------------------------------${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}STEP 3: Provisioning Secrets & Variables in '$OWNER/$REPO'${COLOR_RESET}"
@@ -664,6 +877,11 @@ for i in "${!APP_NAMES[@]}"; do
     else
         SECRET_STATUS_TEXT="Check Manual Setup"
         echo "ERROR: Required GitHub Secrets or Variables provisioning failed." >&2
+        exit 1
+    fi
+
+    if ! chmod 600 "$REG_PEM_PATH"; then
+        echo "ERROR: Could not secure the generated private-key file." >&2
         exit 1
     fi
 

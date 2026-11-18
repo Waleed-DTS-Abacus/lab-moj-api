@@ -97,6 +97,11 @@ if [[ -z "${APP_ID// /}" || -z "${PRIVATE_KEY_PATH// /}" ]]; then
     exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo -e "${COLOR_RED}Error: jq is required to verify the GitHub App token.${COLOR_RESET}" >&2
+    exit 1
+fi
+
 echo -e "${COLOR_MAGENTA}=====================================================================${COLOR_RESET}"
 echo -e "${COLOR_MAGENTA}   TIER 3 VERIFICATION: GitHub App RS256 JWT & Token Exchange Test   ${COLOR_RESET}"
 echo -e "${COLOR_MAGENTA}=====================================================================${COLOR_RESET}"
@@ -140,29 +145,6 @@ JWT="${HEADER_AND_PAYLOAD}.${ENCODED_SIG}"
 
 echo -e "${COLOR_GREEN}      [OK] RS256 JWT generated successfully.${COLOR_RESET}"
 
-# Helper: Parse JSON via jq or python3
-json_extract() {
-    local expr="$1"
-    if command -v jq >/dev/null 2>&1; then
-        jq -r "$expr"
-    else
-        python3 -c 'import json, sys
-data = json.load(sys.stdin)
-expr = sys.argv[1]
-if expr == "app_info":
-    print("{} (Slug: {})".format(data.get("name", ""), data.get("slug", "")))
-elif expr.startswith("install_id:"):
-    org = expr.split(":", 1)[1]
-    for item in data:
-        if item.get("account", {}).get("login") == org:
-            print(item.get("id", ""))
-            break
-elif expr == "token_info":
-    print("{}|{}".format(data.get("token", ""), data.get("expires_at", "")))
-' "$expr"
-    fi
-}
-
 # 3. Authenticate to GitHub API as App
 echo -e "${COLOR_CYAN}[2/4] Authenticating to GitHub API as GitHub App...${COLOR_RESET}"
 if ! APP_RESPONSE="$(curl -fsSL \
@@ -175,11 +157,12 @@ if ! APP_RESPONSE="$(curl -fsSL \
     exit 1
 fi
 
-if command -v jq >/dev/null 2>&1; then
-    APP_DISPLAY="$(printf '%s' "$APP_RESPONSE" | jq -r '"\(.name) (Slug: \(.slug))"')"
-else
-    APP_DISPLAY="$(printf '%s' "$APP_RESPONSE" | json_extract "app_info")"
+if ! jq -e 'type == "object" and (.name | type == "string") and (.slug | type == "string")' \
+    >/dev/null 2>&1 <<< "$APP_RESPONSE"; then
+    echo -e "${COLOR_RED}Error: GitHub returned an invalid App response.${COLOR_RESET}" >&2
+    exit 1
 fi
+APP_DISPLAY="$(printf '%s' "$APP_RESPONSE" | jq -r '"\(.name) (Slug: \(.slug))"')"
 echo -e "${COLOR_GREEN}      [OK] Verified as App: $APP_DISPLAY${COLOR_RESET}"
 
 # 4. Find Installation for OrgName
@@ -194,11 +177,12 @@ if ! INSTALLS_RESPONSE="$(curl -fsSL \
     exit 1
 fi
 
-if command -v jq >/dev/null 2>&1; then
-    INSTALLATION_ID="$(printf '%s' "$INSTALLS_RESPONSE" | jq -r --arg org "$ORG_NAME" '.[] | select(.account.login == $org) | .id' | head -n 1)"
-else
-    INSTALLATION_ID="$(printf '%s' "$INSTALLS_RESPONSE" | json_extract "install_id:$ORG_NAME")"
+if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$INSTALLS_RESPONSE"; then
+    echo -e "${COLOR_RED}Error: GitHub returned an invalid installations response.${COLOR_RESET}" >&2
+    exit 1
 fi
+INSTALLATION_ID="$(printf '%s' "$INSTALLS_RESPONSE" | jq -r --arg org "$ORG_NAME" \
+    '[.[] | select(.account.login == $org) | .id][0] // empty')"
 
 if [[ -z "${INSTALLATION_ID// /}" ]]; then
     echo -e "${COLOR_RED}Error: App is NOT yet installed on organization '$ORG_NAME'. Please install it first!${COLOR_RESET}" >&2
@@ -210,17 +194,8 @@ echo -e "${COLOR_GREEN}      [OK] Found Installation ID: $INSTALLATION_ID (Targe
 echo -e "${COLOR_CYAN}[4/4] Minting ephemeral installation access token...${COLOR_RESET}"
 TOKEN_URL="https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens"
 
-TOKEN_REQUEST_BODY="$(python3 - "$CONFIG_REPO" <<'PYEOF'
-import json
-import sys
-
-repo = sys.argv[1].split("/")[-1]
-print(json.dumps({
-    "repositories": [repo],
-    "permissions": {"contents": "read"}
-}))
-PYEOF
-)"
+TOKEN_REQUEST_BODY="$(jq -cn --arg repository "${CONFIG_REPO##*/}" \
+    '{repositories: [$repository], permissions: {contents: "read"}}')"
 
 if ! TOKEN_RESPONSE="$(curl -fsSL -X POST \
     -H "Content-Type: application/json" \
@@ -234,16 +209,20 @@ if ! TOKEN_RESPONSE="$(curl -fsSL -X POST \
     exit 1
 fi
 
-if command -v jq >/dev/null 2>&1; then
-    INSTALLATION_TOKEN="$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.token')"
-    EXPIRES_AT="$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.expires_at')"
-else
-    IFS='|' read -r INSTALLATION_TOKEN EXPIRES_AT <<< "$(printf '%s' "$TOKEN_RESPONSE" | json_extract "token_info")"
+if ! jq -e '
+    type == "object"
+    and (.token | type == "string" and length > 0)
+    and (.expires_at | type == "string" and length > 0)
+' >/dev/null 2>&1 <<< "$TOKEN_RESPONSE"; then
+    echo -e "${COLOR_RED}Error: GitHub returned an invalid installation token response.${COLOR_RESET}" >&2
+    exit 1
 fi
+INSTALLATION_TOKEN="$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.token')"
+EXPIRES_AT="$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.expires_at')"
 
 # Validate Installation Token Permissions
 # Fail if Contents is not read-only or any other write permission is granted.
-if ! printf '%s' "$TOKEN_RESPONSE" | python3 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/validate-token-permissions.py" "$ORG_NAME/$CONFIG_REPO"; then
+if ! printf '%s' "$TOKEN_RESPONSE" | bash "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/validate-token-permissions.sh" "$ORG_NAME/$CONFIG_REPO"; then
     echo "Error: Installation token permissions validation failed." >&2
     exit 1
 fi
