@@ -43,7 +43,7 @@ jobs:
             --owner "$OWNER" \
             --config-repo "$CONFIG_REPO" \
             --repo "${GITHUB_REPOSITORY#*/}" \
-            --app-name "lab-moj-config-app" \
+            --app-name "lab-moj-config-app-v2" \
             --existing-app-id "$APP_ID" \
             --existing-app-key "$KEY_FILE" \
             --config-file-path "moj/config.json"
@@ -73,7 +73,7 @@ jobs:
             --owner "$OWNER" \
             --config-repo "$CONFIG_REPO" \
             --repo "${GITHUB_REPOSITORY#*/}" \
-            --app-name "lab-moj-config-app" \
+            --app-name "lab-moj-config-app-v2" \
             --existing-app-id "999999999" \
             --existing-app-key "$KEY_FILE" \
             --config-file-path "moj/config.json"; then
@@ -111,7 +111,7 @@ jobs:
             --owner "$OWNER" \
             --config-repo "$CONFIG_REPO" \
             --repo "${GITHUB_REPOSITORY#*/}" \
-            --app-name "lab-moj-config-app" \
+            --app-name "lab-moj-config-app-v2" \
             --existing-app-id "$APP_ID" \
             --existing-app-key "$KEY_FILE" \
             --config-file-path "moj/config.json"; then
