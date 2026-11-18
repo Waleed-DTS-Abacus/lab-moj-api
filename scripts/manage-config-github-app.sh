@@ -18,7 +18,7 @@
 #        CONFIG_REPO, and CONFIG_APP_ID
 #
 # EXAMPLE
-#   ./test-personal-apps.sh --github-token "YOUR_BOOTSTRAP_TOKEN"
+#   ./manage-config-github-app.sh --github-token "YOUR_BOOTSTRAP_TOKEN"
 # ==============================================================================
 
 set -uo pipefail
@@ -584,9 +584,28 @@ for i in "${!APP_NAMES[@]}"; do
         exit 1
     fi
 
-    # Creation disabled until duplicate-app preflight is implemented.
-    echo "ERROR: Create mode requires approved duplicate-app preflight." >&2
-    exit 1
+    # Best-effort duplicate check before opening GitHub registration.
+    APP_SLUG="$(printf '%s' "$APP_NAME" | tr '[:upper:]' '[:lower:]')"
+
+    HTTP_CODE="$(curl -sS -L -o /dev/null -w '%{http_code}' \
+        "https://github.com/apps/${APP_SLUG}")" || {
+        echo "ERROR: Could not check GitHub App name." >&2
+        exit 1
+    }
+
+    case "$HTTP_CODE" in
+        200)
+            echo "ERROR: GitHub App '$APP_SLUG' already exists." >&2
+            exit 1
+            ;;
+        404)
+            echo "Preflight passed: No public App found with slug '$APP_SLUG'."
+            ;;
+        *)
+            echo "ERROR: Unexpected GitHub response: $HTTP_CODE" >&2
+            exit 1
+            ;;
+    esac
     if ! register_personal_app_manifest "$APP_NAME"; then
         echo -e "${COLOR_RED}Error: Failed to create GitHub App for $REPO. Skipping to next.${COLOR_RESET}" >&2
         continue
@@ -597,10 +616,25 @@ for i in "${!APP_NAMES[@]}"; do
     echo -e "${COLOR_DARKGRAY}---------------------------------------------------------------------${COLOR_RESET}"
     INSTALL_URL="https://github.com/settings/apps/${REG_SLUG}/installations"
     echo -e "${COLOR_CYAN}    Launching browser to install App: $INSTALL_URL${COLOR_RESET}"
-    echo -e "${COLOR_YELLOW}    ACTION: Select 'Only select repositories' -> choose '$REPO' (and '$CONFIG_REPO' if available) -> click 'Install'.${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}    ACTION: Select 'Only select repositories' -> choose ONLY '$CONFIG_REPO' -> click 'Install'.${COLOR_RESET}"
     open_browser "$INSTALL_URL"
 
     read -r -p "    Press ENTER after you have installed the App in your browser" _
+
+    echo "Verifying GitHub App installation and repository access..."
+
+    if ! bash "${SCRIPT_DIR}/verify-app-token.sh" \
+        --app-id "$REG_APP_ID" \
+        --private-key-path "$REG_PEM_PATH" \
+        --org-name "$OWNER" \
+        --config-repo "${CONFIG_REPO#*/}" \
+        --config-file-path "$CONFIG_FILE_PATH"; then
+
+        echo "ERROR: GitHub App installation verification failed." >&2
+        exit 1
+    fi
+
+    echo "SUCCESS: GitHub App installation verified."
 
     echo -e "\n${COLOR_DARKGRAY}---------------------------------------------------------------------${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}STEP 3: Provisioning Secrets & Variables in '$OWNER/$REPO'${COLOR_RESET}"

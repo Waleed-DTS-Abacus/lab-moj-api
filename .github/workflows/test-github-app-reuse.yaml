@@ -18,7 +18,7 @@ jobs:
 
       - name: Verify scripts syntax
         run: |
-          bash -n scripts/test-personal-apps.sh
+          bash -n scripts/manage-config-github-app.sh
           bash -n scripts/verify-app-token.sh
 
       - name: Verify existing GitHub App
@@ -38,7 +38,7 @@ jobs:
 
           OWNER="${CONFIG_REPO%%/*}"
 
-          bash scripts/test-personal-apps.sh \
+          bash scripts/manage-config-github-app.sh \
             --mode reuse \
             --owner "$OWNER" \
             --config-repo "$CONFIG_REPO" \
@@ -68,7 +68,7 @@ jobs:
 
           OWNER="${CONFIG_REPO%%/*}"
 
-          if bash scripts/test-personal-apps.sh \
+          if bash scripts/manage-config-github-app.sh \
             --mode reuse \
             --owner "$OWNER" \
             --config-repo "$CONFIG_REPO" \
@@ -106,7 +106,7 @@ jobs:
 
           OWNER="${CONFIG_REPO%%/*}"
 
-          if bash scripts/test-personal-apps.sh \
+          if bash scripts/manage-config-github-app.sh \
             --mode reuse \
             --owner "$OWNER" \
             --config-repo "$CONFIG_REPO" \
