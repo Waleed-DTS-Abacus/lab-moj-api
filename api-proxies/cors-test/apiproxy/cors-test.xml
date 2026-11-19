@@ -2,7 +2,7 @@
 <!-- Task 3 Google Demo: API Proxy validation -->
 <APIProxy revision="2" name="cors-test">
   <DisplayName/>
-  <Description>TC02 Proxy Only Validation</Description>
+  <Description/>
   <CreatedAt>1766163977008</CreatedAt>
   <LastModifiedAt>1766163977008</LastModifiedAt>
   <BasePaths>/cors-test</BasePaths>

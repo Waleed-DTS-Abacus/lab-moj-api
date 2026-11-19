@@ -3,7 +3,7 @@
   "name": "demo-kvm",
   "keyValueEntries": [
     {
-      "name": "username",
+      "name": "username"
       "value": "lab-user-tc03"
     }
   ]
