@@ -190,6 +190,78 @@ if [[ -z "${INSTALLATION_ID// /}" ]]; then
 fi
 echo -e "${COLOR_GREEN}      [OK] Found Installation ID: $INSTALLATION_ID (Target: $ORG_NAME)${COLOR_RESET}"
 
+# Installation Security Validation - Fail Closed
+echo "[SECURITY] Validating original installation permissions..."
+
+if ! jq -e --argjson id "$INSTALLATION_ID" '
+  [.[] | select(.id == $id)] |
+  length == 1
+' >/dev/null <<< "$INSTALLS_RESPONSE"; then
+    echo "FAIL: Invalid installation information." >&2
+    exit 1
+fi
+
+if ! jq -e --argjson id "$INSTALLATION_ID" '
+  .[] | select(.id == $id) |
+  .repository_selection == "selected" and
+  .permissions.contents == "read" and
+  (.permissions | to_entries |
+    all(.[]; .key == "metadata" or
+      (.key == "contents" and .value == "read")))
+' >/dev/null <<< "$INSTALLS_RESPONSE"; then
+    echo "FAIL: Installation permissions or repository selection violate policy." >&2
+    exit 1
+fi
+
+echo "[SECURITY] Auditing all installation repositories..."
+
+TOKEN_URL_AUDIT="https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens"
+
+AUDIT_RESPONSE="$(curl -fsSL -X POST \
+    -H "Authorization: Bearer $JWT" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -d '{}' \
+    "$TOKEN_URL_AUDIT")" || {
+        echo "FAIL: Could not obtain audit token." >&2
+        exit 1
+    }
+
+AUDIT_TOKEN="$(jq -er '.token | select(type == "string" and length > 0)' <<< "$AUDIT_RESPONSE")" || {
+    echo "FAIL: Invalid audit token response." >&2
+    exit 1
+}
+
+unset AUDIT_RESPONSE
+
+REPOS_RESPONSE="$(curl -fsSL \
+    -H "Authorization: Bearer $AUDIT_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/installation/repositories?per_page=100")" || {
+        unset AUDIT_TOKEN
+        echo "FAIL: Could not retrieve installation repositories." >&2
+        exit 1
+    }
+
+unset AUDIT_TOKEN
+
+EXPECTED_REPO="${ORG_NAME}/${CONFIG_REPO##*/}"
+
+if ! jq -e --arg expected "$EXPECTED_REPO" '
+  .total_count == 1 and
+  (.repositories | type == "array" and length == 1) and
+  .repositories[0].full_name == $expected
+' >/dev/null <<< "$REPOS_RESPONSE"; then
+    echo "FAIL: Unauthorized repository access detected." >&2
+    exit 1
+fi
+
+unset REPOS_RESPONSE
+
+echo "PASS: Installation permissions are read-only."
+echo "PASS: Installation is restricted to the authorized config repository."
+
 # 5. Mint Short-Lived Installation Token
 echo -e "${COLOR_CYAN}[4/4] Minting ephemeral installation access token...${COLOR_RESET}"
 TOKEN_URL="https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens"
