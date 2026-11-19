@@ -1,0 +1,10 @@
+{
+  "encrypted": true,
+  "name": "demo-kvm",
+  "keyValueEntries": [
+    {
+      "name": "username",
+      "value": "lab-user"
+    }
+  ]
+}
