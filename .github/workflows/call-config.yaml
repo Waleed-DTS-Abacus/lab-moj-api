@@ -8,6 +8,6 @@ jobs:
   call-config:
     uses: Waleed-DTS-Abacus/lab-ccoe-workflows/.github/workflows/reusable-config.yaml@feat/generic-promotion-validation
     with:
-      app_id: ${{ vars.CONFIG_APP_ID }}
+      app_id: "INVALID_APP_ID"
     secrets:
       CONFIG_APP_PRIVATE_KEY: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}
