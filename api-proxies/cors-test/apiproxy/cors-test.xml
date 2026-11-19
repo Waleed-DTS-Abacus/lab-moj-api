@@ -14,5 +14,5 @@
   </ProxyEndpoints>
   <TargetEndpoints>
     <TargetEndpoint>default</TargetEndpoint>
-  </TargetEndpoints
+  </TargetEndpoints>
 </APIProxy>
