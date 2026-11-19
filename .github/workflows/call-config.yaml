@@ -6,8 +6,11 @@ on:
 
 jobs:
   call-config:
-    uses: Waleed-DTS-Abacus/lab-ccoe-workflows/.github/workflows/reusable-config.yaml@main
+    uses: Waleed-DTS-Abacus/lab-ccoe-workflows/.github/workflows/reusable-config.yaml@feat/generic-promotion-validation
     with:
       app_id: ${{ vars.CONFIG_APP_ID }}
+      config_owner: Waleed-DTS-Abacus
+      config_repo: lab-ccoe-configs
+      config_file_path: moj/config.json
     secrets:
       CONFIG_APP_PRIVATE_KEY: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}

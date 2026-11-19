@@ -1,0 +1,239 @@
+name: GitHub App Reuse E2E Test
+
+on:
+  push:
+    branches:
+      - feat/github-app-migration
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify scripts syntax
+        run: |
+          bash -n scripts/manage-config-github-app.sh
+          bash -n scripts/verify-app-token.sh
+          bash -n scripts/validate-token-permissions.sh
+
+      - name: Verify existing GitHub App
+        shell: bash
+        env:
+          APP_ID: ${{ vars.CONFIG_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}
+          CONFIG_REPO: ${{ vars.CONFIG_REPO }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+
+          printf '%s\n' "$APP_PRIVATE_KEY" > "$KEY_FILE"
+
+          OWNER="${CONFIG_REPO%%/*}"
+
+          bash scripts/manage-config-github-app.sh \
+            --mode reuse \
+            --owner "$OWNER" \
+            --config-repo "$CONFIG_REPO" \
+            --repo "${GITHUB_REPOSITORY#*/}" \
+            --app-name "lab-moj-config-app-v2" \
+            --existing-app-id "$APP_ID" \
+            --existing-app-key "$KEY_FILE" \
+            --config-file-path "moj/config.json"
+  test-invalid-app-id:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Expect authentication failure
+        shell: bash
+        env:
+          APP_PRIVATE_KEY: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}
+          CONFIG_REPO: ${{ vars.CONFIG_REPO }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$APP_PRIVATE_KEY" > "$KEY_FILE"
+
+          OWNER="${CONFIG_REPO%%/*}"
+
+          if bash scripts/manage-config-github-app.sh \
+            --mode reuse \
+            --owner "$OWNER" \
+            --config-repo "$CONFIG_REPO" \
+            --repo "${GITHUB_REPOSITORY#*/}" \
+            --app-name "lab-moj-config-app-v2" \
+            --existing-app-id "999999999" \
+            --existing-app-key "$KEY_FILE" \
+            --config-file-path "moj/config.json"; then
+
+            echo "FAIL: Invalid App ID was accepted!"
+            exit 1
+          else
+            echo "PASS: Invalid App ID was rejected."
+          fi
+
+  test-invalid-private-key:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Expect invalid private key failure
+        shell: bash
+        env:
+          APP_ID: ${{ vars.CONFIG_APP_ID }}
+          CONFIG_REPO: ${{ vars.CONFIG_REPO }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+
+          printf '%s\n' "INVALID_PRIVATE_KEY_FOR_TESTING" > "$KEY_FILE"
+
+          OWNER="${CONFIG_REPO%%/*}"
+
+          if bash scripts/manage-config-github-app.sh \
+            --mode reuse \
+            --owner "$OWNER" \
+            --config-repo "$CONFIG_REPO" \
+            --repo "${GITHUB_REPOSITORY#*/}" \
+            --app-name "lab-moj-config-app-v2" \
+            --existing-app-id "$APP_ID" \
+            --existing-app-key "$KEY_FILE" \
+            --config-file-path "moj/config.json"; then
+
+            echo "FAIL: Invalid Private Key was accepted!"
+            exit 1
+          else
+            echo "PASS: Invalid Private Key was rejected."
+          fi
+
+  test-unauthorized-repository:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Generate installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CONFIG_APP_ID }}
+          private-key: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}
+          owner: Waleed-DTS-Abacus
+
+      - name: Verify unauthorized repository is blocked
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          ALLOWED_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $APP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Waleed-DTS-Abacus/lab-ccoe-configs/contents/moj/config.json")
+
+          if [ "$ALLOWED_STATUS" != "200" ]; then
+            echo "FAIL: Authorized repository was not accessible (HTTP $ALLOWED_STATUS)."
+            exit 1
+          fi
+
+          echo "PASS: Authorized repository access confirmed."
+
+          HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $APP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Waleed-DTS-Abacus/lab-ccoe-workflows/contents/README.md")
+
+          if [ "$HTTP_STATUS" = "404" ] || [ "$HTTP_STATUS" = "403" ]; then
+            echo "PASS: Unauthorized repository access denied (HTTP $HTTP_STATUS)."
+          else
+            echo "FAIL: Unexpected HTTP status: $HTTP_STATUS"
+            exit 1
+          fi
+
+  test-token-permissions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate token permission policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VALIDATOR="scripts/validate-token-permissions.sh"
+
+          expect_accept() {
+            local label="$1"
+            local json="$2"
+            shift 2
+            if printf '%s\n' "$json" | bash "$VALIDATOR" "$@"; then
+              echo "PASS: $label"
+            else
+              echo "FAIL: $label should be accepted."
+              exit 1
+            fi
+          }
+
+          expect_reject() {
+            local label="$1"
+            local json="$2"
+            shift 2
+            if printf '%s\n' "$json" | bash "$VALIDATOR" "$@"; then
+              echo "FAIL: $label should be rejected."
+              exit 1
+            else
+              echo "PASS: $label rejected."
+            fi
+          }
+
+          expect_accept "Read-only permissions accepted" \
+            '{"permissions":{"contents":"read"}}'
+          expect_reject "contents: write rejected" \
+            '{"permissions":{"contents":"write"}}'
+          expect_reject "Additional issues: write rejected" \
+            '{"permissions":{"contents":"read","issues":"write"}}'
+          expect_reject "Additional admin permission rejected" \
+            '{"permissions":{"contents":"read","issues":"admin"}}'
+          expect_reject "Missing permissions rejected" \
+            '{}'
+          expect_reject "Missing contents permission rejected" \
+            '{"permissions":{"issues":"read"}}'
+          expect_reject "Malformed permissions rejected" \
+            '{"permissions":[]}'
+          expect_reject "Malformed permission value rejected" \
+            '{"permissions":{"contents":"read","issues":[]}}'
+          expect_accept "Single expected repository accepted" \
+            '{"permissions":{"contents":"read"},"repositories":[{"full_name":"Waleed-DTS-Abacus/lab-ccoe-configs"}]}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Expanded repository scope rejected" \
+            '{"permissions":{"contents":"read"},"repositories":[{"full_name":"Waleed-DTS-Abacus/lab-ccoe-configs"},{"full_name":"Waleed-DTS-Abacus/lab-ccoe-workflows"}]}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Missing repository scope rejected" \
+            '{"permissions":{"contents":"read"}}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Malformed repository scope rejected" \
+            '{"permissions":{"contents":"read"},"repositories":[{"name":"lab-ccoe-configs"}]}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Empty repository name rejected" \
+            '{"permissions":{"contents":"read"},"repositories":[{"full_name":""}]}' \
+            'Waleed-DTS-Abacus/lab-ccoe-configs'
+          expect_reject "Malformed JSON rejected" \
+            '{"permissions":'
