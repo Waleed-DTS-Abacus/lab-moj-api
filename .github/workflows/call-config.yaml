@@ -10,4 +10,4 @@ jobs:
     with:
       app_id: ${{ vars.CONFIG_APP_ID }}
     secrets:
-      CONFIG_APP_PRIVATE_KEY: ""
+      CONFIG_APP_PRIVATE_KEY: ${{ secrets.CONFIG_APP_PRIVATE_KEY }}
