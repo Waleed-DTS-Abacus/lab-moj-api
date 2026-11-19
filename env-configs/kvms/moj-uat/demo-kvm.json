@@ -3,9 +3,8 @@
   "name": "demo-kvm",
   "keyValueEntries": [
     {
-      "name": "username"
-      "value": "lab-user-tc03"
+      "name": "username",
+      "value": "lab-user"
     }
   ]
 }
-
