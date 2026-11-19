@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Task 3 Google Demo: API Proxy validation -->
+<APIProxy revision="2" name="cors-test">
+  <DisplayName/>
+  <Description/>
+  <CreatedAt>1766163977008</CreatedAt>
+  <LastModifiedAt>1766163977008</LastModifiedAt>
+  <BasePaths>/cors-test</BasePaths>
+  <Policies>
+    <Policy>AM-AddCORS</Policy>
+  </Policies>
+  <ProxyEndpoints>
+    <ProxyEndpoint>default</ProxyEndpoint>
+  </ProxyEndpoints>
+  <TargetEndpoints>
+    <TargetEndpoint>default</TargetEndpoint>
+  </TargetEndpoints>
+</APIProxy>

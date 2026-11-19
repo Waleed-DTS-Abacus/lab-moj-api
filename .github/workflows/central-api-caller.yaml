@@ -1,0 +1,17 @@
+name: Unified Lab - KVM and Proxy Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'env-configs/kvms/**'
+      - 'api-proxies/**'
+      - '.github/workflows/central-api-caller.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  call-central-pipeline:
+    uses: Waleed-DTS-Abacus/lab-ccoe-workflows/.github/workflows/reusable-api-pipeline.yaml@main
